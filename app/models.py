@@ -6,7 +6,7 @@ import bcrypt
 import urlparse
 import itertools
 import traceback
-import onetimepass
+import pyotp
 
 from datetime import datetime
 from distutils.version import StrictVersion
@@ -27,6 +27,14 @@ if 'LDAP_TYPE' in app.config.keys():
     LDAP_USERNAMEFIELD = app.config['LDAP_USERNAMEFIELD']
 else:
     LDAP_TYPE = False
+
+if 'PRETTY_IPV6_PTR' in app.config.keys():
+    import dns.inet
+    import dns.name
+    import dns.reversename
+    PRETTY_IPV6_PTR = app.config['PRETTY_IPV6_PTR']
+else:
+    PRETTY_IPV6_PTR = False
 
 PDNS_STATS_URL = app.config['PDNS_STATS_URL']
 PDNS_API_KEY = app.config['PDNS_API_KEY']
@@ -83,10 +91,10 @@ class User(db.Model):
 
     def is_authenticated(self):
         return True
- 
+
     def is_active(self):
         return True
- 
+
     def is_anonymous(self):
         return False
 
@@ -103,17 +111,18 @@ class User(db.Model):
         return 'otpauth://totp/PowerDNS-Admin:%s?secret=%s&issuer=PowerDNS-Admin' % (self.username, self.otp_secret)
 
     def verify_totp(self, token):
-        return onetimepass.valid_totp(token, self.otp_secret)
+        totp = pyotp.TOTP(self.otp_secret)
+        return totp.verify(int(token))
 
     def get_hashed_password(self, plain_text_password=None):
         # Hash a password for the first time
         #   (Using bcrypt, the salt is saved into the hash itself)
         pw = plain_text_password if plain_text_password else self.plain_text_password
-        return bcrypt.hashpw(pw, bcrypt.gensalt())
+        return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt())
 
-    def check_password(self, hashed_password):        
+    def check_password(self, hashed_password):
         # Check hased password. Useing bcrypt, the salt is saved into the hash itself
-        return bcrypt.checkpw(self.plain_text_password, hashed_password)
+        return bcrypt.checkpw(self.plain_text_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
     def get_user_info_by_id(self):
         user_info = User.query.get(int(self.id))
@@ -164,73 +173,68 @@ class User(db.Model):
                 if user_info.password and self.check_password(user_info.password):
                     logging.info('User "%s" logged in successfully' % self.username)
                     return True
-                else:
-                    logging.error('User "%s" input a wrong password' % self.username)
-                    return False
-            else:
-                logging.warning('User "%s" does not exist' % self.username)
+                logging.error('User "%s" input a wrong password' % self.username)
                 return False
 
-        elif method == 'LDAP':
+            logging.warning('User "%s" does not exist' % self.username)
+            return False
+
+        if method == 'LDAP':
             if not LDAP_TYPE:
                 logging.error('LDAP authentication is disabled')
                 return False
 
+            searchFilter = "(&(objectcategory=person)(samaccountname=%s))" % self.username
             if LDAP_TYPE == 'ldap':
               searchFilter = "(&(%s=%s)%s)" % (LDAP_USERNAMEFIELD, self.username, LDAP_FILTER)
               logging.info('Ldap searchFilter "%s"' % searchFilter)
-            else:
-              searchFilter = "(&(objectcategory=person)(samaccountname=%s))" % self.username
-            try:
-                result = self.ldap_search(searchFilter, LDAP_SEARCH_BASE)
-            except Exception, e:
-                raise
 
+            result = self.ldap_search(searchFilter, LDAP_SEARCH_BASE)
             if not result:
                 logging.warning('User "%s" does not exist' % self.username)
                 return False
-            else:
-                ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
-                l = ldap.initialize(LDAP_URI)
-                l.set_option(ldap.OPT_REFERRALS, 0)
-                l.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
-                l.set_option(ldap.OPT_X_TLS,ldap.OPT_X_TLS_DEMAND)
-                l.set_option( ldap.OPT_X_TLS_DEMAND, True )
-                l.set_option( ldap.OPT_DEBUG_LEVEL, 255 )
-                l.protocol_version = ldap.VERSION3
 
+            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+            l = ldap.initialize(LDAP_URI)
+            l.set_option(ldap.OPT_REFERRALS, 0)
+            l.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+            l.set_option(ldap.OPT_X_TLS,ldap.OPT_X_TLS_DEMAND)
+            l.set_option( ldap.OPT_X_TLS_DEMAND, True )
+            l.set_option( ldap.OPT_DEBUG_LEVEL, 255 )
+            l.protocol_version = ldap.VERSION3
+
+            try:
+                ldap_username = result[0][0][0]
+                l.simple_bind_s(ldap_username, self.password)
+                logging.info('User "%s" logged in successfully' % self.username)
+            except Exception:
+                logging.error('User "%s" input a wrong password' % self.username)
+                return False
+
+            # create user if not exist in the db
+            if not User.query.filter(User.username == self.username).first():
                 try:
-                    ldap_username = result[0][0][0]
-                    l.simple_bind_s(ldap_username, self.password)
-                    logging.info('User "%s" logged in successfully' % self.username)
-                    
-                    # create user if not exist in the db
-                    if User.query.filter(User.username == self.username).first() == None:
-                        try:
-                            # try to get user's firstname & lastname from LDAP
-                            # this might be changed in the future
-                            self.firstname = result[0][0][1]['givenName'][0]
-                            self.lastname = result[0][0][1]['sn'][0]
-                            self.email = result[0][0][1]['mail'][0]
-                        except:
-                            self.firstname = self.username
-                            self.lastname = ''
+                    # try to get user's firstname & lastname from LDAP
+                    # this might be changed in the future
+                    self.firstname = result[0][0][1]['givenName'][0]
+                    self.lastname = result[0][0][1]['sn'][0]
+                    self.email = result[0][0][1]['mail'][0]
+                except Exception:
+                    self.firstname = self.username
+                    self.lastname = ''
 
-                        # first register user will be in Administrator role
-                        if User.query.count() == 0:
-                            self.role_id = Role.query.filter_by(name='Administrator').first().id
-                        else:
-                            self.role_id = Role.query.filter_by(name='User').first().id    
+                # first register user will be in Administrator role
+                self.role_id = Role.query.filter_by(name='User').first().id
+                if User.query.count() == 0:
+                    self.role_id = Role.query.filter_by(name='Administrator').first().id
 
-                        self.create_user()
-                        logging.info('Created user "%s" in the DB' % self.username)
-                    return True
-                except:
-                    logging.error('User "%s" input a wrong password' % self.username)
-                    return False
-        else:
-            logging.error('Unsupported authentication method')
-            return False
+                self.create_user()
+                logging.info('Created user "%s" in the DB' % self.username)
+
+            return True
+
+        logging.error('Unsupported authentication method')
+        return False
 
     def create_user(self):
         """
@@ -238,11 +242,8 @@ class User(db.Model):
         We will create a local user (in DB) in order to manage user
         profile such as name, roles,...
         """
-        user = User(username=self.username, firstname=self.firstname, lastname=self.lastname, role_id=self.role_id, email=self.email)
-        db.session.add(user)
+        db.session.add(self)
         db.session.commit()
-        # assgine user_id to current_user after create in the DB
-        self.id = user.id
 
     def create_local_user(self):
         """
@@ -258,53 +259,43 @@ class User(db.Model):
         if user:
             return 'Email already existed'
 
-        try:
-            # first register user will be in Administrator role
-            if User.query.count() == 0:
-                self.role_id = Role.query.filter_by(name='Administrator').first().id
-            else:
-                self.role_id = Role.query.filter_by(name='User').first().id
+        # first register user will be in Administrator role
+        self.role_id = Role.query.filter_by(name='User').first().id
+        if User.query.count() == 0:
+            self.role_id = Role.query.filter_by(name='Administrator').first().id
+        self.password = self.get_hashed_password(self.plain_text_password)
 
-            user = User(username=self.username, firstname=self.firstname, lastname=self.lastname, role_id=self.role_id, email=self.email, password=self.get_hashed_password(self.plain_text_password))
-            db.session.add(user)
-            db.session.commit()
-            return True
-        except Exception, e:
-            raise
+        db.session.add(self)
+        db.session.commit()
+        return True
 
     def update_profile(self, enable_otp=None):
         """
         Update user profile
         """
+
         user = User.query.filter(User.username == self.username).first()
-        if user:
-            if self.firstname:
-                user.firstname = self.firstname
-            if self.lastname:
-                user.lastname = self.lastname
-            if self.email:
-                user.email = self.email
-            if self.plain_text_password:
-                user.password = self.get_hashed_password(self.plain_text_password)
-            if self.avatar:
-                user.avatar = self.avatar
+        if not user:
+            return False
 
-            if enable_otp == True:
-                # generate the opt secret key
-                user.otp_secret = base64.b32encode(os.urandom(10)).decode('utf-8')
-            elif enable_otp == False:
-                # set otp_secret="" means we want disable the otp authenticaion.
-                user.otp_secret = ""
-            else:
-                # do nothing.
-                pass
+        user.firstname = self.firstname if self.firstname else user.firstname
+        user.lastname = self.lastname if self.lastname else user.lastname
+        user.email = self.email if self.email else user.email
+        user.password = self.get_hashed_password(self.plain_text_password) if self.plain_text_password else user.password
+        user.avatar = self.avatar if self.avatar else user.avatar
 
-            try:
-                db.session.commit()
-                return True
-            except:
-                db.session.rollback()
-                return False
+        user.otp_secret = ""
+        if enable_otp == True:
+            # generate the opt secret key
+            user.otp_secret = base64.b32encode(os.urandom(10)).decode('utf-8')
+
+        try:
+            db.session.add(user)
+            db.session.commit()
+            return True
+        except Exception:
+            db.session.rollback()
+            return False
 
     def get_domain(self):
         """
@@ -338,7 +329,7 @@ class User(db.Model):
         Revoke all privielges from a user
         """
         user = User.query.filter(User.username == self.username).first()
-        
+
         if user:
             user_id = user.id
             try:
@@ -385,8 +376,8 @@ class Role(db.Model):
         self.id = id
         self.name = name
         self.description = description
-        
-    # allow database autoincrement to do its own ID assignments    
+
+    # allow database autoincrement to do its own ID assignments
     def __init__(self, name=None, description=None):
         self.id = None
         self.name = name
@@ -402,18 +393,18 @@ class DomainSetting(db.Model):
     domain = db.relationship('Domain', back_populates='settings')
     setting = db.Column(db.String(255), nullable = False)
     value = db.Column(db.String(255))
-    
+
     def __init__(self, id=None, setting=None, value=None):
         self.id = id
         self.setting = setting
         self.value = value
-    
+
     def __repr__(self):
         return '<DomainSetting %r for $d>' % (setting, self.domain.name)
-    
+
     def __eq__(self, other):
         return self.setting == other.setting
-    
+
     def set(self, value):
         try:
             self.value = value
@@ -448,7 +439,7 @@ class Domain(db.Model):
 
     def __repr__(self):
         return '<Domain %r>' % (self.name)
-    
+
     def add_setting(self, setting, value):
         try:
             self.settings.append(DomainSetting(setting=setting, value=value))
@@ -487,7 +478,7 @@ class Domain(db.Model):
         Return domain id
         """
         domain = Domain.query.filter(Domain.name==name).first()
-        return domain.id 
+        return domain.id
 
     def update(self):
         """
@@ -638,10 +629,10 @@ class Domain(db.Model):
         """
 
         domain_id = self.get_id_by_name(self.name)
-        
+
         domain_user_ids = self.get_user()
         new_user_ids = [u.id for u in User.query.filter(User.username.in_(new_user_list)).all()] if new_user_list else []
-        
+
         removed_ids = list(set(domain_user_ids).difference(new_user_ids))
         added_ids = list(set(new_user_ids).difference(domain_user_ids))
 
@@ -741,7 +732,13 @@ class Record(object):
         if NEW_SCHEMA:
             rrsets = jdata['rrsets']
             for rrset in rrsets:
-                rrset['name'] = rrset['name'].rstrip('.')
+                r_name = rrset['name'].rstrip('.')
+                if PRETTY_IPV6_PTR: # only if activated
+                    if rrset['type'] == 'PTR': # only ptr
+                        if 'ip6.arpa' in r_name: # only if v6-ptr
+                            r_name = dns.reversename.to_address(dns.name.from_text(r_name))
+
+                rrset['name'] = r_name
                 rrset['content'] = rrset['records'][0]['content']
                 rrset['disabled'] = rrset['records'][0]['disabled']
             return {'records': rrsets}
@@ -816,7 +813,7 @@ class Record(object):
         """
         # get list of current records we have in powerdns
         current_records = self.get_record_data(domain_name)['records']
-        
+
         # convert them to list of list (just has [name, type]) instead of list of hash
         # to compare easier
         list_current_records = [[x['name'],x['type']] for x in current_records]
@@ -837,13 +834,40 @@ class Record(object):
         """
         Apply record changes to domain
         """
-        deleted_records, new_records = self.compare(domain, post_records)
+        records = []
+        for r in post_records:
+            r_name = domain if r['record_name'] in ['@', ''] else r['record_name'] + '.' + domain
+            r_type = r['record_type']
+            if PRETTY_IPV6_PTR: # only if activated
+                if NEW_SCHEMA: # only if new schema
+                    if r_type == 'PTR': # only ptr
+                        if ':' in r['record_name']: # dirty ipv6 check
+                            r_name = r['record_name']
+            
+            record = {
+                        "name": r_name,
+                        "type": r_type,
+                        "content": r['record_data'],
+                        "disabled": True if r['record_status'] == 'Disabled' else False,
+                        "ttl": int(r['record_ttl']) if r['record_ttl'] else 3600,
+                    }
+            records.append(record)
+        
+        deleted_records, new_records = self.compare(domain, records)
 
         records = []
         for r in deleted_records:
+            r_name = r['name'] + '.' if NEW_SCHEMA else r['name']
+            r_type = r['type']
+            if PRETTY_IPV6_PTR: # only if activated
+                if NEW_SCHEMA: # only if new schema
+                    if r_type == 'PTR': # only ptr
+                        if ':' in r['name']: # dirty ipv6 check
+                            r_name = dns.reversename.from_address(r['name']).to_text()
+                            
             record = {
-                        "name": r['name'] + '.' if NEW_SCHEMA else r['name'],
-                        "type": r['type'],
+                        "name": r_name,
+                        "type": r_type,
                         "changetype": "DELETE",
                         "records": [
                         ]
@@ -855,9 +879,16 @@ class Record(object):
         records = []
         for r in new_records:
             if NEW_SCHEMA:
+                r_name = r['name'] + '.'
+                r_type = r['type']
+                if PRETTY_IPV6_PTR: # only if activated
+                    if r_type == 'PTR': # only ptr
+                        if ':' in r['name']: # dirty ipv6 check
+                            r_name = r['name']
+
                 record = {
-                            "name": r['name'] + '.',
-                            "type": r['type'],
+                            "name": r_name,
+                            "type": r_type,
                             "changetype": "REPLACE",
                             "ttl": r['ttl'],
                             "records": [
@@ -891,10 +922,19 @@ class Record(object):
         records = sorted(records, key = lambda item: (item["name"], item["type"], item["changetype"]))
         for key, group in itertools.groupby(records, lambda item: (item["name"], item["type"], item["changetype"])):
             if NEW_SCHEMA:
+                r_name = key[0]
+                r_type = key[1]
+                r_changetype = key[2]
+                
+                if PRETTY_IPV6_PTR: # only if activated
+                    if r_type == 'PTR': # only ptr
+                        if ':' in r_name: # dirty ipv6 check
+                            r_name = dns.reversename.from_address(r_name).to_text()
+                
                 new_record = {
-                        "name": key[0],
-                        "type": key[1],
-                        "changetype": key[2],
+                        "name": r_name,
+                        "type": r_type,
+                        "changetype": r_changetype,
                         "ttl": None,
                         "records": []
                     }
@@ -912,9 +952,9 @@ class Record(object):
                         "disabled": temp_disabled
                     })
                 final_records.append(new_record)
-                
+
             else:
-                
+
                 final_records.append({
                         "name": key[0],
                         "type": key[1],
@@ -962,11 +1002,11 @@ class Record(object):
                         "name": self.name,
                         "type": self.type,
                         "changetype": "DELETE",
-                        "records": [ 
+                        "records": [
                             {
                                 "name": self.name,
                                 "type": self.type
-                            } 
+                            }
                         ]
                     }
                 ]
@@ -1070,7 +1110,7 @@ class Server(object):
         """
         headers = {}
         headers['X-API-Key'] = PDNS_API_KEY
-        
+
         try:
             jdata = utils.fetch_json(urlparse.urljoin(PDNS_STATS_URL, API_EXTENDED_URL + '/servers/%s/config' % self.server_id), headers=headers, method='GET')
             return jdata
@@ -1098,7 +1138,7 @@ class Server(object):
 class History(db.Model):
     id = db.Column(db.Integer, primary_key = True)
     msg = db.Column(db.String(256))
-    detail = db.Column(db.Text())
+    detail = db.Column(db.Text().with_variant(db.Text(length=2**24-2), 'mysql'))
     created_by = db.Column(db.String(128))
     created_on = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -1146,12 +1186,12 @@ class Setting(db.Model):
         self.id = id
         self.name = name
         self.value = value
-        
+
     # allow database autoincrement to do its own ID assignments
     def __init__(self, name=None, value=None):
         self.id = None
         self.name = name
-        self.value = value    
+        self.value = value
 
     def set_mainteance(self, mode):
         """
@@ -1195,7 +1235,7 @@ class Setting(db.Model):
             logging.debug(traceback.format_exec())
             db.session.rollback()
             return False
-        
+
     def set(self, setting, value):
         setting = str(setting)
         new_value = str(value)
